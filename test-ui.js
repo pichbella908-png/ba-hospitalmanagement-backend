@@ -42,7 +42,7 @@ server.listen(0, '127.0.0.1', async () => {
   vm.runInContext(inlineScript[1], ctx);
   for (const [hostname, expectedApiBase] of [
     ['clinic-sovanvitou.synology.me', ''],
-    ['app.example.com', 'https://clinicsovanvitou-backend-67e0.onrender.com']
+    ['app.example.com', 'https://ba-hospitalmanagement-backend.onrender.com']
   ]) {
     const hostLocation = { hostname }, hostContext = vm.createContext({ location: hostLocation, window: { location: hostLocation } });
     vm.runInContext(inlineScript[1], hostContext);
