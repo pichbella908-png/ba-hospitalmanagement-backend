@@ -22,7 +22,7 @@ const PHOTO_RE = /^[a-f0-9]{32}\.(jpg|png|webp)$/;
 const DOCUMENT_UPLOAD_RE = /^[a-f0-9]{32}$/;
 const PATIENT_DOCUMENT_TYPES = new Set(['referral', 'referral-letter', 'treatment', 'hospital', 'medical-card', 'health', 'birth', 'medical-rest-a', 'prescription-note']);
 const DOCUMENT_UPLOAD_MAX_BYTES = 25 * 1024 * 1024;
-const CORS = process.env.CORS_ORIGIN || '';
+const CORS = (process.env.CORS_ORIGIN || '').split(',').map((value) => value.trim()).filter(Boolean);
 const tzh = Number.isFinite(Number(process.env.TZ_OFFSET_HOURS)) ? Number(process.env.TZ_OFFSET_HOURS) : 7;
 const TZ = `${tzh >= 0 ? '+' : ''}${tzh} hours`;
 let ocrWorkerPromise = null;
@@ -1519,12 +1519,20 @@ function serve(req, res, pathname) {
   });
 }
 
-function serveUpload(res, name) {
+function getCorsOrigin(req) {
+  if (!CORS.length) return null;
+  const origin = req.headers.origin;
+  if (!origin) return CORS[0];
+  return CORS.includes(origin) ? origin : null;
+}
+
+function serveUpload(req, res, name) {
   if (!PHOTO_RE.test(name)) { res.writeHead(404); return res.end(); }
   fs.readFile(path.join(UPLOADS, name), (err, buf) => {
     if (err) { res.writeHead(404); return res.end(); }
     const type = { jpg: 'image/jpeg', png: 'image/png', webp: 'image/webp' }[name.split('.')[1]];
-    if (CORS) res.setHeader('Access-Control-Allow-Origin', CORS);
+    const corsOrigin = getCorsOrigin(req);
+    if (corsOrigin) res.setHeader('Access-Control-Allow-Origin', corsOrigin);
     res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'public, max-age=31536000, immutable' });
     res.end(buf);
   });
@@ -1535,8 +1543,9 @@ const server = http.createServer(async (req, res) => {
   res.setHeader('X-Frame-Options', 'DENY');
   res.setHeader('Referrer-Policy', 'no-referrer');
   res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self' *; frame-ancestors 'none'");
-  if (CORS) {
-    res.setHeader('Access-Control-Allow-Origin', CORS);
+  const corsOrigin = getCorsOrigin(req);
+  if (corsOrigin) {
+    res.setHeader('Access-Control-Allow-Origin', corsOrigin);
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Patient-Document-Patient, X-Patient-Document-Name, X-Patient-Document-Date, X-Patient-Document-Type');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,DELETE,OPTIONS');
     res.setHeader('Access-Control-Expose-Headers', 'X-Total-Count');
@@ -1546,7 +1555,7 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, 'http://localhost');
     if (url.pathname.startsWith('/api/')) await api(req, res, url);
-    else if (url.pathname.startsWith('/uploads/') && req.method === 'GET') serveUpload(res, url.pathname.slice(9));
+    else if (url.pathname.startsWith('/uploads/') && req.method === 'GET') serveUpload(req, res, url.pathname.slice(9));
     else serve(req, res, url.pathname);
   } catch (e) {
     if (e instanceof HttpError) return send(res, e.status, { error: e.message }, e.status === 413 ? { Connection: 'close' } : {});
