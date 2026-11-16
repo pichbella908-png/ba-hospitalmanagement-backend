@@ -37,10 +37,12 @@ const dflt = (k) => (k === 'i' || k === 'b' ? '0' : k === 'j' ? "'{}'" : "''");
 
 let pool = null;
 let initPromise = null;
+let memoryFallbackUsed = false;
 const dataDir = path.join(__dirname, 'data');
 fs.mkdirSync(dataDir, { recursive: true });
 
 function useMemoryDb() {
+  memoryFallbackUsed = true;
   const { newDb, DataType } = require('pg-mem');
   const mem = newDb();
   mem.public.registerFunction({
@@ -62,7 +64,8 @@ function useMemoryDb() {
 
 function getPool() {
   if (!pool) {
-    if (process.env.USE_MEM_DB === 'true' || (!process.env.DATABASE_URL && process.env.NODE_ENV === 'test')) {
+    const explicitPgConfig = process.env.DATABASE_URL || process.env.PGHOST || process.env.PGPORT || process.env.PGUSER || process.env.PGPASSWORD !== undefined || process.env.PGDATABASE;
+    if (process.env.USE_MEM_DB === 'true' || (!explicitPgConfig && process.env.USE_MEM_DB !== 'false') || (!process.env.DATABASE_URL && process.env.NODE_ENV === 'test')) {
       return useMemoryDb();
     }
     if (process.env.DATABASE_URL) {
@@ -84,9 +87,19 @@ function getPool() {
   return pool;
 }
 
-function setPool(p) {
+function setPool(p, fallback = false) {
   pool = p;
   initPromise = null;
+  memoryFallbackUsed = !!fallback;
+}
+
+function shouldUseMemoryFallback(error) {
+  if (process.env.USE_MEM_DB === 'false') return false;
+  if (!error || typeof error !== 'object') return false;
+  const code = String(error.code || '').toLowerCase();
+  const message = String(error.message || '').toLowerCase();
+  const hints = ['connection refused', 'timeout exceeded', 'connect econnrefused', 'ecconnrefused', 'econnrefused', 'enotfound', 'econnreset', 'econnabort', 'password authentication failed', 'database does not exist', 'could not connect to server'];
+  return hints.some((hint) => message.includes(hint) || code.includes(hint));
 }
 
 async function ensureDbExists() {
@@ -117,111 +130,137 @@ async function ensureDbExists() {
   }
 }
 
+async function initializeSchema(p) {
+  // 1. Create RES tables
+  for (const [t, { cols }] of Object.entries(RES)) {
+    const defs = Object.entries(cols).map(([c, ty]) =>
+      `"${c}" ${SQLT[ty[0]]} NOT NULL DEFAULT ${dflt(ty[0])}`).join(',');
+    await p.query(`CREATE TABLE IF NOT EXISTS "${t}" (
+      id SERIAL PRIMARY KEY,
+      ${defs},
+      created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    )`);
+    for (const [c, ty] of Object.entries(cols)) {
+      await p.query(`ALTER TABLE "${t}" ADD COLUMN IF NOT EXISTS "${c}" ${SQLT[ty[0]]} NOT NULL DEFAULT ${dflt(ty[0])}`);
+    }
+  }
+  await p.query(`CREATE TABLE IF NOT EXISTS patient_portal_tokens (
+    id SERIAL PRIMARY KEY,
+    patient_id INTEGER NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
+    token_hash TEXT NOT NULL UNIQUE,
+    revoked_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+  )`);
+  await p.query('CREATE INDEX IF NOT EXISTS patient_portal_tokens_patient_idx ON patient_portal_tokens(patient_id)');
+  await p.query('CREATE UNIQUE INDEX IF NOT EXISTS payslips_doctor_period_unique ON payslips(doctor_id, period_year, period_month)');
+
+  // 2. Create clinic table
+  await p.query(`CREATE TABLE IF NOT EXISTS clinic (
+    id INTEGER PRIMARY KEY CHECK(id=1),
+    name TEXT NOT NULL DEFAULT '',
+    specialty TEXT NOT NULL DEFAULT '',
+    address TEXT NOT NULL DEFAULT '',
+    phone TEXT NOT NULL DEFAULT '',
+    currency TEXT NOT NULL DEFAULT 'KHR',
+    rate INTEGER NOT NULL DEFAULT 4000,
+    logo TEXT NOT NULL DEFAULT '',
+    qr TEXT NOT NULL DEFAULT '',
+    banner TEXT NOT NULL DEFAULT '',
+    footer_banner TEXT NOT NULL DEFAULT '',
+    footer_banner_text TEXT NOT NULL DEFAULT '',
+    footer_banner_mode TEXT NOT NULL DEFAULT 'image',
+    show_name INTEGER NOT NULL DEFAULT 1,
+    show_address INTEGER NOT NULL DEFAULT 1,
+    show_phone INTEGER NOT NULL DEFAULT 1,
+    print_header TEXT NOT NULL DEFAULT '',
+    print_footer TEXT NOT NULL DEFAULT '',
+    print_template TEXT NOT NULL DEFAULT '{}',
+    cnf_text TEXT NOT NULL DEFAULT '{}',
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+  )`);
+  await p.query(`ALTER TABLE clinic ADD COLUMN IF NOT EXISTS print_header TEXT NOT NULL DEFAULT ''`);
+  await p.query(`ALTER TABLE clinic ADD COLUMN IF NOT EXISTS print_footer TEXT NOT NULL DEFAULT ''`);
+  await p.query(`ALTER TABLE clinic ADD COLUMN IF NOT EXISTS footer_banner TEXT NOT NULL DEFAULT ''`);
+  await p.query(`ALTER TABLE clinic ADD COLUMN IF NOT EXISTS footer_banner_text TEXT NOT NULL DEFAULT ''`);
+  await p.query(`ALTER TABLE clinic ADD COLUMN IF NOT EXISTS footer_banner_mode TEXT NOT NULL DEFAULT 'image'`);
+  await p.query(`ALTER TABLE clinic ADD COLUMN IF NOT EXISTS print_template TEXT NOT NULL DEFAULT '{}'`);
+  await p.query(`ALTER TABLE clinic ADD COLUMN IF NOT EXISTS cnf_text TEXT NOT NULL DEFAULT '{}'`);
+  await p.query(`INSERT INTO clinic(id) VALUES(1) ON CONFLICT (id) DO NOTHING`);
+
+  // 3. Create users, settings, sales, sale_items
+  await p.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      email TEXT NOT NULL UNIQUE,
+      name TEXT NOT NULL DEFAULT '',
+      role TEXT NOT NULL DEFAULT 'staff',
+      permissions TEXT NOT NULL DEFAULT '{}',
+      pass TEXT NOT NULL,
+      created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    );
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions TEXT NOT NULL DEFAULT '{}';
+    CREATE TABLE IF NOT EXISTS settings (
+      key TEXT PRIMARY KEY,
+      value TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS sales (
+      id SERIAL PRIMARY KEY,
+      total INTEGER NOT NULL,
+      method TEXT NOT NULL,
+      user_id INTEGER,
+      created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE TABLE IF NOT EXISTS sale_items (
+      id SERIAL PRIMARY KEY,
+      sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
+      medicine_id INTEGER,
+      name TEXT NOT NULL,
+      qty INTEGER NOT NULL,
+      price INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_sales_created ON sales(created_at);
+    CREATE INDEX IF NOT EXISTS idx_appt_date ON appointments(date);
+    CREATE INDEX IF NOT EXISTS idx_patients_name ON patients(name);
+    CREATE INDEX IF NOT EXISTS idx_records_patient ON records(patient_id, kind);
+  `);
+}
+
 async function initDb() {
   if (initPromise) return initPromise;
   initPromise = (async () => {
-    await ensureDbExists();
-    const p = getPool();
-    // 1. Create RES tables
-    for (const [t, { cols }] of Object.entries(RES)) {
-      const defs = Object.entries(cols).map(([c, ty]) =>
-        `"${c}" ${SQLT[ty[0]]} NOT NULL DEFAULT ${dflt(ty[0])}`).join(',');
-      await p.query(`CREATE TABLE IF NOT EXISTS "${t}" (
-        id SERIAL PRIMARY KEY,
-        ${defs},
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-      )`);
-      for (const [c, ty] of Object.entries(cols)) {
-        await p.query(`ALTER TABLE "${t}" ADD COLUMN IF NOT EXISTS "${c}" ${SQLT[ty[0]]} NOT NULL DEFAULT ${dflt(ty[0])}`);
+    try {
+      await ensureDbExists();
+      const p = getPool();
+      await initializeSchema(p);
+    } catch (error) {
+      if (!memoryFallbackUsed && shouldUseMemoryFallback(error)) {
+        console.warn('PostgreSQL unavailable; switching to the in-memory database fallback.');
+        const fallbackPool = useMemoryDb();
+        setPool(fallbackPool, true);
+        await initializeSchema(fallbackPool);
+        return;
       }
+      throw error;
     }
-    await p.query(`CREATE TABLE IF NOT EXISTS patient_portal_tokens (
-      id SERIAL PRIMARY KEY,
-      patient_id INTEGER NOT NULL REFERENCES patients(id) ON DELETE CASCADE,
-      token_hash TEXT NOT NULL UNIQUE,
-      revoked_at TIMESTAMPTZ,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
-    )`);
-    await p.query('CREATE INDEX IF NOT EXISTS patient_portal_tokens_patient_idx ON patient_portal_tokens(patient_id)');
-    await p.query('CREATE UNIQUE INDEX IF NOT EXISTS payslips_doctor_period_unique ON payslips(doctor_id, period_year, period_month)');
-
-    // 2. Create clinic table
-    await p.query(`CREATE TABLE IF NOT EXISTS clinic (
-      id INTEGER PRIMARY KEY CHECK(id=1),
-      name TEXT NOT NULL DEFAULT '',
-      specialty TEXT NOT NULL DEFAULT '',
-      address TEXT NOT NULL DEFAULT '',
-      phone TEXT NOT NULL DEFAULT '',
-      currency TEXT NOT NULL DEFAULT 'KHR',
-      rate INTEGER NOT NULL DEFAULT 4000,
-      logo TEXT NOT NULL DEFAULT '',
-      qr TEXT NOT NULL DEFAULT '',
-      banner TEXT NOT NULL DEFAULT '',
-      footer_banner TEXT NOT NULL DEFAULT '',
-      footer_banner_text TEXT NOT NULL DEFAULT '',
-      footer_banner_mode TEXT NOT NULL DEFAULT 'image',
-      show_name INTEGER NOT NULL DEFAULT 1,
-      show_address INTEGER NOT NULL DEFAULT 1,
-      show_phone INTEGER NOT NULL DEFAULT 1,
-      print_header TEXT NOT NULL DEFAULT '',
-      print_footer TEXT NOT NULL DEFAULT '',
-      print_template TEXT NOT NULL DEFAULT '{}',
-      cnf_text TEXT NOT NULL DEFAULT '{}',
-      updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-    )`);
-    await p.query(`ALTER TABLE clinic ADD COLUMN IF NOT EXISTS print_header TEXT NOT NULL DEFAULT ''`);
-    await p.query(`ALTER TABLE clinic ADD COLUMN IF NOT EXISTS print_footer TEXT NOT NULL DEFAULT ''`);
-    await p.query(`ALTER TABLE clinic ADD COLUMN IF NOT EXISTS footer_banner TEXT NOT NULL DEFAULT ''`);
-    await p.query(`ALTER TABLE clinic ADD COLUMN IF NOT EXISTS footer_banner_text TEXT NOT NULL DEFAULT ''`);
-    await p.query(`ALTER TABLE clinic ADD COLUMN IF NOT EXISTS footer_banner_mode TEXT NOT NULL DEFAULT 'image'`);
-    await p.query(`ALTER TABLE clinic ADD COLUMN IF NOT EXISTS print_template TEXT NOT NULL DEFAULT '{}'`);
-    await p.query(`ALTER TABLE clinic ADD COLUMN IF NOT EXISTS cnf_text TEXT NOT NULL DEFAULT '{}'`);
-    await p.query(`INSERT INTO clinic(id) VALUES(1) ON CONFLICT (id) DO NOTHING`);
-
-    // 3. Create users, settings, sales, sale_items
-    await p.query(`
-      CREATE TABLE IF NOT EXISTS users (
-        id SERIAL PRIMARY KEY,
-        email TEXT NOT NULL UNIQUE,
-        name TEXT NOT NULL DEFAULT '',
-        role TEXT NOT NULL DEFAULT 'staff',
-        permissions TEXT NOT NULL DEFAULT '{}',
-        pass TEXT NOT NULL,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-      );
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS permissions TEXT NOT NULL DEFAULT '{}';
-      CREATE TABLE IF NOT EXISTS settings (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS sales (
-        id SERIAL PRIMARY KEY,
-        total INTEGER NOT NULL,
-        method TEXT NOT NULL,
-        user_id INTEGER,
-        created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-      );
-      CREATE TABLE IF NOT EXISTS sale_items (
-        id SERIAL PRIMARY KEY,
-        sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,
-        medicine_id INTEGER,
-        name TEXT NOT NULL,
-        qty INTEGER NOT NULL,
-        price INTEGER NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_sales_created ON sales(created_at);
-      CREATE INDEX IF NOT EXISTS idx_appt_date ON appointments(date);
-      CREATE INDEX IF NOT EXISTS idx_patients_name ON patients(name);
-      CREATE INDEX IF NOT EXISTS idx_records_patient ON records(patient_id, kind);
-    `);
   })();
   return initPromise;
 }
 
 async function query(text, params) {
   await initDb();
-  return getPool().query(text, params);
+  const poolRef = getPool();
+  try {
+    return await poolRef.query(text, params);
+  } catch (error) {
+    if (!memoryFallbackUsed && shouldUseMemoryFallback(error)) {
+      console.warn('PostgreSQL unavailable; switching to the in-memory database fallback.');
+      setPool(useMemoryDb(), true);
+      await initDb();
+      return pool.query(text, params);
+    }
+    throw error;
+  }
 }
 
 async function queryOne(text, params) {
@@ -255,6 +294,7 @@ async function close() {
     await pool.end();
     pool = null;
     initPromise = null;
+    memoryFallbackUsed = false;
   }
 }
 

@@ -6,8 +6,27 @@ process.env.NODE_ENV = 'test';
 process.env.USE_MEM_DB = 'true';
 process.env.JWT_SECRET = 'x'.repeat(40);
 const { server } = require('./server');
-const { close } = require('./db');
+const { close, query } = require('./db');
 
+(async () => {
+  const saved = { ...process.env };
+  delete process.env.USE_MEM_DB;
+  delete process.env.DATABASE_URL;
+  delete process.env.PGHOST;
+  delete process.env.PGPORT;
+  delete process.env.PGUSER;
+  delete process.env.PGPASSWORD;
+  delete process.env.PGDATABASE;
+  try {
+    await close();
+    const result = await query('SELECT 1 AS ok');
+    assert.equal(result.rows[0].ok, 1);
+    console.log('  ✓ no explicit PostgreSQL config falls back to the in-memory database');
+  } finally {
+    Object.assign(process.env, saved);
+    await close();
+  }
+})().then(() => {
 server.listen(0, '127.0.0.1', async () => {
   const base = `http://127.0.0.1:${server.address().port}`;
   let token = null, medicineSaleItem = null, medicineSaleId = null;
@@ -457,4 +476,5 @@ server.listen(0, '127.0.0.1', async () => {
     try { await close(); } catch {}
     process.exit(process.exitCode);
   });
+});
 });
