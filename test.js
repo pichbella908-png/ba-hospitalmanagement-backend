@@ -45,6 +45,13 @@ server.listen(0, '127.0.0.1', async () => {
     token = (await call('POST', '/api/auth/login', { email: 'admin@clinic.test', password: 'correct-horse' })).body.token; assert.ok(token); ok('login returns token');
     assert.equal((await call('GET', '/api/patients', null, token + 'x')).status, 401); ok('tampered token rejected');
 
+    const corsStatus = await fetch(base + '/api/health', {
+      method: 'GET',
+      headers: { Origin: 'https://ba-hospitalmanagement.pages.dev', 'Access-Control-Request-Method': 'GET' },
+    });
+    assert.equal(corsStatus.headers.get('access-control-allow-origin'), 'https://ba-hospitalmanagement.pages.dev');
+    assert.equal((await corsStatus.json()).ok, true); ok('Pages frontend origin is allowed by CORS');
+
     const p = await call('POST', '/api/patients', { name: '  Sok Dara ', age: '34', sex: 'M', type: 'OPD' });
     assert.equal(p.status, 201); assert.equal(p.body.name, 'Sok Dara'); assert.equal(p.body.age, 34); ok('create patient (trimmed, coerced)');
     assert.equal((await call('POST', '/api/patients', { age: 3 })).status, 400); ok('name required');

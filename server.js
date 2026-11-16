@@ -1520,10 +1520,24 @@ function serve(req, res, pathname) {
 }
 
 function getCorsOrigin(req) {
-  if (!CORS.length) return null;
   const origin = req.headers.origin;
-  if (!origin) return CORS[0];
-  return CORS.includes(origin) ? origin : null;
+  if (CORS.length) {
+    if (!origin) return CORS[0];
+    return CORS.includes(origin) ? origin : null;
+  }
+  if (!origin) return null;
+  try {
+    const hostname = new URL(origin).hostname.toLowerCase();
+    const allowedHosts = [
+      'localhost', '127.0.0.1',
+      'ba-hospitalmanagement.pages.dev',
+      'ba-hospitalmanagement-backend.onrender.com',
+    ];
+    if (allowedHosts.includes(hostname)) return origin;
+    return hostname.endsWith('.local') || hostname.endsWith('.synology.me') || hostname.endsWith('.pages.dev') || hostname.endsWith('.github.dev') || hostname.endsWith('.workers.dev') ? origin : null;
+  } catch {
+    return null;
+  }
 }
 
 function serveUpload(req, res, name) {
