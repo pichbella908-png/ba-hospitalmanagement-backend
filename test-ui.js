@@ -2165,8 +2165,9 @@ server.listen(0, '127.0.0.1', async () => {
     assert.ok(opdStatusCell.includes(`class="pill opd clk" data-a="bedfollowup:${p.id}" title="Follow Up">`), 'OPD patient IPD/OPD cell should show a Follow Up pill like the OPD status: ' + opdStatusCell);
     assert.ok(!run(`cellsFull(D.pt.find(x=>x.id==${p.id}),0,true).name`).includes('bedfollowup:'), 'Follow Up icon should not remain under the patient name');
     assert.ok(html.includes('class="card patient-table-wrap"'), 'patient list should use the responsive full-width table wrapper');
-    assert.match(fs.readFileSync(path.join(frontendDir, 'styles.css'), 'utf8'), /table\.ptb\s*\{[^}]*width:\s*100%;[^}]*min-width:\s*0;[^}]*table-layout:\s*fixed;/s, 'patient table should fit the available width without a forced minimum width');
-    assert.match(fs.readFileSync(path.join(frontendDir, 'styles.css'), 'utf8'), /\.patient-table-wrap\s*\{[^}]*overflow-x:\s*hidden;/s, 'patient list should not require horizontal scrolling');
+    assert.match(fs.readFileSync(path.join(frontendDir, 'styles.css'), 'utf8'), /table\.ptb\s*\{[^}]*width:\s*100%;[^}]*min-width:\s*1360px;[^}]*table-layout:\s*fixed;/s, 'patient table should preserve the reference width');
+    assert.match(fs.readFileSync(path.join(frontendDir, 'styles.css'), 'utf8'), /\.patient-table-wrap\s*\{[^}]*overflow-x:\s*auto;/s, 'patient list should scroll horizontally when needed');
+    assert.match(fs.readFileSync(path.join(frontendDir, 'styles.css'), 'utf8'), /@media\s*\(max-width:\s*820px\)\s*\{[\s\S]*?table\.ptb\s*\{[^}]*min-width:\s*1360px;/s, 'mobile patient table should preserve its scrollable minimum width');
     await run(`api('POST','ipd',{name:'Test Patient',code:'${p.id}',room:'',paid:0,out:0})`); await run(`api('PUT','patients/${p.id}',{type:'IPD'})`); await run('load()');
     const ipdId = run(`D.ipd.find(x=>x.code=='${p.id}').id`), ipdHtml = run(`ipdRow(D.ipd.find(x=>x.code=='${p.id}'))`);
     assert.ok(run('ipdPage(false)').includes('<th>IPD/OPD</th>') && ipdHtml.includes(`data-a="ipdreturn:${p.id}"`) && ipdHtml.includes('>IPD</button>') && run(`ipdRow({code:'missing-patient',name:'Legacy patient',out:0})`).includes('>IPD</span>'), 'IPD table should make an active IPD status actionable and keep unlinked admissions labeled');
