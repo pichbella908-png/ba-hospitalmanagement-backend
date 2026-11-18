@@ -15,7 +15,9 @@ npm start                   # http://127.0.0.1:3000
 npm test                    # API tests + UI logic tests
 ```
 
-Open the site. On first run it asks you to create the admin account (email + password of 8+ characters). After that it is a normal sign-in page. Admins can add staff accounts through `POST /api/users`.
+Open the site and choose **Create a clinic account**. The first signup creates a pending request, then sends a secure approval link to `tepsochet70@gmail.com`. Approval provisions a new PostgreSQL database for that clinic and makes the requester its administrator. The requester can sign in only after approval. Configure SMTP and `APP_URL` before offering signup.
+
+Each clinic uses its own PostgreSQL database (`clinic_<random id>`); the configured `PGDATABASE` remains the account directory and legacy installation database. The PostgreSQL role must be allowed to create databases. Staff accounts created by a clinic administrator remain within that clinic's database.
 
 Docker / Synology: reserve `192.168.101.12` for the NAS in your router, then use Synology Container Manager to create a Project from the repository folder containing `compose.yaml`. Copy `.env.nas.example` to `.env`, replace both placeholder values with separate strong secrets, and start the project. The app is available on the local network at `http://192.168.101.12:3000`. The app port is bound only to that NAS address; PostgreSQL and application data use persistent Docker volumes.
 
@@ -31,14 +33,22 @@ This direct HTTP address is not encrypted. Keep it on a trusted local network an
 | `PGUSER`          | PostgreSQL username                               | `postgres`                                                 |
 | `PGPASSWORD`      | PostgreSQL password                               | `""`                                                       |
 | `PGDATABASE`      | PostgreSQL database name                          | `sovanvitou`                                               |
+| `PGADMIN_DATABASE`| Database used to create clinic databases           | `postgres`                                                 |
 | `PGSSL`           | Set `true` for SSL (e.g. Supabase, Neon, AWS RDS) | `false`                                                    |
 | `JWT_SECRET`      | 32+ random characters for signing tokens          | (auto-generated in DB)                                     |
+| `APP_URL`         | Public frontend URL used in approval links         | (required for signup)                                      |
+| `SMTP_HOST`       | SMTP server hostname                               | (required for signup)                                      |
+| `SMTP_PORT`       | SMTP server port                                    | `587`                                                      |
+| `SMTP_SECURE`     | Set `true` for implicit TLS (usually port 465)      | `false`                                                    |
+| `SMTP_USER`       | SMTP username, if required                          | (optional)                                                 |
+| `SMTP_PASSWORD`   | SMTP password, if required                          | (optional)                                                 |
+| `SMTP_FROM`       | Verified sender address                             | (required for signup)                                      |
 | `PORT`            | HTTP port                                         | `3000`                                                     |
 | `TZ_OFFSET_HOURS` | UTC timezone offset (7 for Cambodia)              | `7`                                                        |
 
 ## Roles and permissions
 
-The first account is an administrator and has all permissions. Administrators can create staff accounts in Settings and grant independent **View, Create, Edit, Delete, and Print** permissions for patient records; appointments/IPD; clinical records; pharmacy/services/POS; finance/reports; doctors/payroll; templates/reference data; clinic settings; and user management. Staff can only access the sections and actions granted to their account. Existing staff accounts without a saved permission matrix keep the previous staff defaults.
+The approved signup owner is an administrator with all permissions. Administrators can create staff accounts in Settings and grant independent **View, Create, Edit, Delete, and Print** permissions for patient records; appointments/IPD; clinical records; pharmacy/services/POS; finance/reports; doctors/payroll; templates/reference data; clinic settings; and user management. Staff can only access the sections and actions granted to their account. Existing staff accounts without a saved permission matrix keep the previous staff defaults.
 
 ## Print templates
 
@@ -49,8 +59,11 @@ Users with clinic-settings access can open **Administration → Print Templates*
 | Method         | Path                                               | Notes                                                                                                                                                                                                                                                                       |
 | -------------- | -------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | GET            | `/api/health`                                      | No auth                                                                                                                                                                                                                                                                     |
-| GET            | `/api/auth/status`                                 | `{needsSetup}`; no auth                                                                                                                                                                                                                                                     |
-| POST           | `/api/auth/setup`                                  | First admin only, works once                                                                                                                                                                                                                                                |
+| GET            | `/api/auth/status`                                 | `{needsSetup, signupEnabled}`; no auth                                                                                                                                                                                                                                     |
+| POST           | `/api/auth/signup`                                 | `{name, clinic_name, email, password}`; creates a pending request and emails the approver; no auth                                                                                                                                                                          |
+| GET            | `/api/auth/approval?token=...`                     | Approval-link details; no auth                                                                                                                                                                                                                                             |
+| POST           | `/api/auth/approval`                               | `{token, decision:"approve"\|"reject"}`; secure email-link action; no auth                                                                                                                                                                                                 |
+| POST           | `/api/auth/setup`                                  | Disabled (`410`); public setup cannot bypass approval                                                                                                                                                                                                                        |
 | POST           | `/api/auth/login`                                  | Returns `{token, user}`; token lasts 12 h                                                                                                                                                                                                                                   |
 | GET            | `/api/auth/me`                                     | Current user                                                                                                                                                                                                                                                                |
 | POST           | `/api/auth/password`                               | `{current, password}`; change your own password                                                                                                                                                                                                                             |
@@ -93,7 +106,7 @@ This holds medical records, so treat the following as required, not optional:
 
 1. **HTTPS.** Put it behind a reverse proxy (Caddy or nginx) with a certificate. Tokens and passwords are otherwise sent in clear text. Keep `HOST=127.0.0.1` and let the proxy face the internet.
 2. **Set `JWT_SECRET`** (32+ random characters) and keep `.env` private.
-3. **Regular PostgreSQL backups** using `pg_dump`.
+3. **Regular PostgreSQL backups** for the account-directory database and every `clinic_<random id>` database using `pg_dump`.
 4. Check your local health-data and privacy rules before storing real patient information.
 #   b a - h o s p i t a l m a n a g e m e n t - b a c k e n d  
  #   b a - h o s p i t a l m a n a g e m e n t - b a c k e n d  

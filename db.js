@@ -2,6 +2,7 @@
 const pg = require('pg');
 const path = require('path');
 const fs = require('fs');
+const { AsyncLocalStorage } = require('async_hooks');
 
 try { process.loadEnvFile(path.join(__dirname, '.env')); } catch { /* no .env file */ }
 
@@ -38,11 +39,12 @@ const dflt = (k) => (k === 'i' || k === 'b' ? '0' : k === 'j' ? "'{}'" : "''");
 let pool = null;
 let initPromise = null;
 let memoryFallbackUsed = false;
+const tenantPools = new Map();
+const tenantContext = new AsyncLocalStorage();
 const dataDir = path.join(__dirname, 'data');
 fs.mkdirSync(dataDir, { recursive: true });
 
-function useMemoryDb() {
-  memoryFallbackUsed = true;
+function createMemoryPool() {
   const { newDb, DataType } = require('pg-mem');
   const mem = newDb();
   mem.public.registerFunction({
@@ -58,11 +60,26 @@ function useMemoryDb() {
     implementation: (d, f) => (d ? new Date(d).toISOString().slice(0, 10) : null),
   });
   const pgAdapter = mem.adapters.createPg();
-  pool = new pgAdapter.Pool();
+  return new pgAdapter.Pool();
+}
+
+function useMemoryDb() {
+  memoryFallbackUsed = true;
+  pool = createMemoryPool();
   return pool;
 }
 
 function getPool() {
+  const tenant = tenantContext.getStore();
+  if (tenant && tenant.dbName) {
+    let tenantPool = tenantPools.get(tenant.dbName);
+    if (!tenantPool) {
+      if (memoryFallbackUsed) throw new Error('Clinic database is not available');
+      tenantPool = new pg.Pool(databaseConfig(tenant.dbName));
+      tenantPools.set(tenant.dbName, tenantPool);
+    }
+    return tenantPool;
+  }
   if (!pool) {
     const explicitPgConfig = process.env.DATABASE_URL || process.env.PGHOST || process.env.PGPORT || process.env.PGUSER || process.env.PGPASSWORD !== undefined || process.env.PGDATABASE;
     if (process.env.USE_MEM_DB === 'true' || (!explicitPgConfig && process.env.USE_MEM_DB !== 'false') || (!process.env.DATABASE_URL && process.env.NODE_ENV === 'test')) {
@@ -87,10 +104,103 @@ function getPool() {
   return pool;
 }
 
+function getMasterPool() {
+  if (pool) return pool;
+  let masterPool;
+  tenantContext.run(null, () => { masterPool = getPool(); });
+  return masterPool;
+}
+
+function withTenantDatabase(dbName, callback) {
+  if (typeof dbName !== 'string' || !/^clinic_[a-f0-9]{32}$/.test(dbName)) {
+    throw new Error('Invalid clinic database name');
+  }
+  return tenantContext.run({ dbName }, callback);
+}
+
+function databaseConfig(database) {
+  const ssl = process.env.PGSSL === 'true' ? { rejectUnauthorized: false } : undefined;
+  if (process.env.DATABASE_URL) {
+    const url = new URL(process.env.DATABASE_URL);
+    url.pathname = `/${database}`;
+    return { connectionString: url.toString(), ssl };
+  }
+  return {
+    host: process.env.PGHOST || '127.0.0.1',
+    port: Number(process.env.PGPORT) || 5432,
+    user: process.env.PGUSER || 'postgres',
+    password: process.env.PGPASSWORD !== undefined ? process.env.PGPASSWORD : '',
+    database,
+    ssl,
+  };
+}
+
+async function createTenantDatabase(dbName) {
+  if (!/^clinic_[a-f0-9]{32}$/.test(dbName)) throw new Error('Invalid clinic database name');
+  await initDb();
+  if (memoryFallbackUsed) {
+    const tenantPool = createMemoryPool();
+    tenantPools.set(dbName, tenantPool);
+    try {
+      await initializeSchema(tenantPool);
+    } catch (error) {
+      tenantPools.delete(dbName);
+      await tenantPool.end();
+      throw error;
+    }
+    return;
+  }
+
+  const adminDatabase = process.env.PGADMIN_DATABASE || 'postgres';
+  const admin = new pg.Client(databaseConfig(adminDatabase));
+  await admin.connect();
+  try {
+    const exists = await admin.query('SELECT 1 FROM pg_database WHERE datname=$1', [dbName]);
+    if (exists.rowCount) throw new Error('Clinic database already exists');
+    await admin.query(`CREATE DATABASE "${dbName}"`);
+  } finally {
+    await admin.end();
+  }
+
+  const tenantPool = new pg.Pool(databaseConfig(dbName));
+  tenantPools.set(dbName, tenantPool);
+  try {
+    await initializeSchema(tenantPool);
+  } catch (error) {
+    tenantPools.delete(dbName);
+    await tenantPool.end();
+    try { await dropTenantDatabase(dbName); } catch (cleanupError) {
+      console.error('Failed to clean up an incomplete clinic database:', cleanupError.message);
+    }
+    throw error;
+  }
+}
+
+async function dropTenantDatabase(dbName) {
+  if (!/^clinic_[a-f0-9]{32}$/.test(dbName)) throw new Error('Invalid clinic database name');
+  const tenantPool = tenantPools.get(dbName);
+  if (tenantPool) {
+    tenantPools.delete(dbName);
+    await tenantPool.end();
+  }
+  if (memoryFallbackUsed) return;
+  const admin = new pg.Client(databaseConfig(process.env.PGADMIN_DATABASE || 'postgres'));
+  await admin.connect();
+  try {
+    await admin.query(`DROP DATABASE IF EXISTS "${dbName}"`);
+  } finally {
+    await admin.end();
+  }
+}
+
 function setPool(p, fallback = false) {
   pool = p;
   initPromise = null;
   memoryFallbackUsed = !!fallback;
+}
+
+function isMemoryDb() {
+  return memoryFallbackUsed;
 }
 
 function shouldUseMemoryFallback(error) {
@@ -106,16 +216,7 @@ async function ensureDbExists() {
   if (process.env.USE_MEM_DB === 'true' || process.env.NODE_ENV === 'test') return;
   const targetDb = process.env.PGDATABASE || 'sovanvitou';
   if (targetDb === 'postgres') return;
-  const config = process.env.DATABASE_URL
-    ? { connectionString: process.env.DATABASE_URL.replace(/\/[^/?]+(\?|$)/, '/postgres$1') }
-    : {
-        host: process.env.PGHOST || '127.0.0.1',
-        port: Number(process.env.PGPORT) || 5432,
-        user: process.env.PGUSER || 'postgres',
-        password: process.env.PGPASSWORD !== undefined ? process.env.PGPASSWORD : '',
-        ssl: process.env.PGSSL === 'true' ? { rejectUnauthorized: false } : undefined,
-        database: 'postgres',
-      };
+  const config = databaseConfig(process.env.PGADMIN_DATABASE || 'postgres');
   const client = new pg.Client(config);
   try {
     await client.connect();
@@ -130,7 +231,7 @@ async function ensureDbExists() {
   }
 }
 
-async function initializeSchema(p) {
+async function initializeSchema(p, master = false) {
   // 1. Create RES tables
   for (const [t, { cols }] of Object.entries(RES)) {
     const defs = Object.entries(cols).map(([c, ty]) =>
@@ -224,6 +325,38 @@ async function initializeSchema(p) {
     CREATE INDEX IF NOT EXISTS idx_patients_name ON patients(name);
     CREATE INDEX IF NOT EXISTS idx_records_patient ON records(patient_id, kind);
   `);
+  if (master) {
+    await p.query(`
+      CREATE TABLE IF NOT EXISTS clinic_tenants (
+        id SERIAL PRIMARY KEY,
+        clinic_name TEXT NOT NULL,
+        database_name TEXT NOT NULL UNIQUE,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE TABLE IF NOT EXISTS clinic_users (
+        email TEXT PRIMARY KEY,
+        tenant_id INTEGER NOT NULL REFERENCES clinic_tenants(id) ON DELETE CASCADE,
+        user_id INTEGER NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(tenant_id, user_id)
+      );
+      CREATE TABLE IF NOT EXISTS portal_tenants (
+        token_hash TEXT PRIMARY KEY,
+        tenant_id INTEGER NOT NULL REFERENCES clinic_tenants(id) ON DELETE CASCADE
+      );
+      CREATE TABLE IF NOT EXISTS signup_requests (
+        id SERIAL PRIMARY KEY,
+        email TEXT NOT NULL UNIQUE,
+        name TEXT NOT NULL,
+        clinic_name TEXT NOT NULL,
+        pass TEXT,
+        token_hash TEXT NOT NULL,
+        status TEXT NOT NULL DEFAULT 'pending',
+        expires_at TIMESTAMPTZ NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+  }
 }
 
 async function initDb() {
@@ -231,14 +364,14 @@ async function initDb() {
   initPromise = (async () => {
     try {
       await ensureDbExists();
-      const p = getPool();
-      await initializeSchema(p);
+      const p = getMasterPool();
+      await initializeSchema(p, true);
     } catch (error) {
       if (!memoryFallbackUsed && shouldUseMemoryFallback(error)) {
         console.warn('PostgreSQL unavailable; switching to the in-memory database fallback.');
         const fallbackPool = useMemoryDb();
         setPool(fallbackPool, true);
-        await initializeSchema(fallbackPool);
+        await initializeSchema(fallbackPool, true);
         return;
       }
       throw error;
@@ -263,9 +396,23 @@ async function query(text, params) {
   }
 }
 
+async function queryMaster(text, params) {
+  return tenantContext.run(null, () => query(text, params));
+}
+
 async function queryOne(text, params) {
   const res = await query(text, params);
   return res.rows[0] || null;
+}
+
+async function queryMasterOne(text, params) {
+  const res = await queryMaster(text, params);
+  return res.rows[0] || null;
+}
+
+async function queryMasterAll(text, params) {
+  const res = await queryMaster(text, params);
+  return res.rows;
 }
 
 async function queryAll(text, params) {
@@ -289,7 +436,25 @@ async function tx(fn) {
   }
 }
 
+async function txMaster(fn) {
+  await initDb();
+  const client = await getMasterPool().connect();
+  try {
+    await client.query('BEGIN');
+    const result = await fn(client);
+    await client.query('COMMIT');
+    return result;
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function close() {
+  for (const tenantPool of tenantPools.values()) await tenantPool.end();
+  tenantPools.clear();
   if (pool) {
     await pool.end();
     pool = null;
@@ -302,11 +467,19 @@ module.exports = {
   getPool,
   setPool,
   useMemoryDb,
+  isMemoryDb,
   query,
+  queryMaster,
+  queryMasterOne,
+  queryMasterAll,
   queryOne,
   queryAll,
   tx,
   initDb,
+  createTenantDatabase,
+  dropTenantDatabase,
+  withTenantDatabase,
+  txMaster,
   close,
   RES,
   CLINIC,

@@ -5,7 +5,7 @@ const ExcelJS = require('exceljs');
 process.env.NODE_ENV = 'test';
 process.env.USE_MEM_DB = 'true';
 process.env.JWT_SECRET = 'x'.repeat(40);
-const { server } = require('./server');
+const { server, approvalEmails } = require('./server');
 const { close, query } = require('./db');
 
 (async () => {
@@ -38,11 +38,19 @@ server.listen(0, '127.0.0.1', async () => {
   try {
     assert.equal((await call('GET', '/api/patients')).status, 401); ok('API rejects unauthenticated requests');
     assert.equal((await call('GET', '/api/auth/status')).body.needsSetup, true); ok('first run needs setup');
-    assert.equal((await call('POST', '/api/auth/setup', { email: 'bad', password: 'longenough' })).status, 400); ok('setup validates email');
-    assert.equal((await call('POST', '/api/auth/setup', { email: 'admin@clinic.test', password: 'correct-horse' })).status, 201); ok('admin created');
-    assert.equal((await call('POST', '/api/auth/setup', { email: 'x@y.zz', password: 'correct-horse' })).status, 403); ok('setup is one-time only');
-    assert.equal((await call('POST', '/api/auth/login', { email: 'admin@clinic.test', password: 'wrong' })).status, 401); ok('wrong password rejected');
-    token = (await call('POST', '/api/auth/login', { email: 'admin@clinic.test', password: 'correct-horse' })).body.token; assert.ok(token); ok('login returns token');
+    assert.equal((await call('POST', '/api/auth/setup', { email: 'admin@clinic.test', password: 'correct-horse' })).status, 410); ok('public setup cannot bypass approval');
+    assert.equal((await call('POST', '/api/auth/signup', { name: 'Clinic Admin', clinic_name: 'Test Clinic', email: 'bad', password: 'correct-horse' }, null)).status, 400); ok('signup validates email');
+    assert.equal((await call('POST', '/api/auth/signup', { name: 'Clinic Admin', clinic_name: 'Test Clinic', email: 'admin@clinic.test', password: 'correct-horse' }, null)).status, 202); ok('signup request accepted');
+    const approvalLink = new URL(approvalEmails[0].text.match(/https?:\/\/\S+/)[0]);
+    const approvalToken = approvalLink.searchParams.get('token');
+    assert.equal(approvalEmails[0].to, 'tepsochet70@gmail.com');
+    assert.equal((await call('POST', '/api/auth/login', { email: 'admin@clinic.test', password: 'correct-horse' }, null)).status, 403); ok('pending account cannot sign in');
+    assert.equal((await call('GET', '/api/auth/approval?token=' + encodeURIComponent(approvalToken), null, null)).body.clinic_name, 'Test Clinic');
+    assert.equal((await call('POST', '/api/auth/approval', { token: approvalToken, decision: 'approve' }, null)).body.status, 'approved'); ok('approval provisions clinic database and admin');
+    assert.equal((await call('GET', '/api/auth/status')).body.needsSetup, false); ok('approved clinic removes first-run state');
+    assert.equal((await call('POST', '/api/auth/login', { email: 'admin@clinic.test', password: 'wrong' }, null)).status, 401); ok('wrong password rejected');
+    token = (await call('POST', '/api/auth/login', { email: 'admin@clinic.test', password: 'correct-horse' }, null)).body.token; assert.ok(token); ok('approved admin login returns token');
+    assert.equal((await call('GET', '/api/auth/me')).body.role, 'admin'); ok('new clinic owner is an administrator');
     assert.equal((await call('GET', '/api/patients', null, token + 'x')).status, 401); ok('tampered token rejected');
 
     const corsStatus = await fetch(base + '/api/health', {
@@ -54,6 +62,17 @@ server.listen(0, '127.0.0.1', async () => {
 
     const p = await call('POST', '/api/patients', { name: '  Sok Dara ', age: '34', sex: 'M', type: 'OPD' });
     assert.equal(p.status, 201); assert.equal(p.body.name, 'Sok Dara'); assert.equal(p.body.age, 34); ok('create patient (trimmed, coerced)');
+    assert.equal((await call('POST', '/api/auth/signup', { name: 'Second Admin', clinic_name: 'Second Clinic', email: 'second@clinic.test', password: 'correct-horse' }, null)).status, 202);
+    const secondApprovalToken = new URL(approvalEmails[1].text.match(/https?:\/\/\S+/)[0]).searchParams.get('token');
+    assert.equal((await call('POST', '/api/auth/approval', { token: secondApprovalToken, decision: 'approve' }, null)).body.status, 'approved');
+    const firstClinicToken = token;
+    token = (await call('POST', '/api/auth/login', { email: 'second@clinic.test', password: 'correct-horse' }, null)).body.token;
+    assert.equal((await call('GET', '/api/patients')).body.length, 0); ok('clinic databases isolate patient records');
+    token = firstClinicToken;
+    assert.equal((await call('POST', '/api/auth/signup', { name: 'Rejected Admin', clinic_name: 'Rejected Clinic', email: 'rejected@clinic.test', password: 'correct-horse' }, null)).status, 202);
+    const rejectionToken = new URL(approvalEmails[2].text.match(/https?:\/\/\S+/)[0]).searchParams.get('token');
+    assert.equal((await call('POST', '/api/auth/approval', { token: rejectionToken, decision: 'reject' }, null)).body.status, 'rejected');
+    assert.equal((await call('POST', '/api/auth/login', { email: 'rejected@clinic.test', password: 'correct-horse' }, null)).status, 401); ok('rejected signup does not create an account');
     assert.equal((await call('POST', '/api/patients', { age: 3 })).status, 400); ok('name required');
     assert.equal((await call('POST', '/api/patients', { name: 'A', type: 'XYZ' })).status, 400); ok('type validated');
     assert.equal((await call('POST', '/api/patients', { name: "Robert'); DROP TABLE patients;--" })).status, 201); ok('SQL injection stored as plain text');
@@ -474,7 +493,7 @@ server.listen(0, '127.0.0.1', async () => {
     assert.equal(textSettings.footer_banner_mode, 'text'); assert.equal(textSettings.footer_banner_text, 'Clinic hours\nContact details');
     const ct = (await call('PUT', '/api/clinic', { cnf_text: { acc: 'Custom wording' } })).body; assert.equal(JSON.parse(ct.cnf_text).acc, 'Custom wording'); assert.equal(JSON.parse((await call('GET', '/api/clinic')).body.cnf_text).acc, 'Custom wording'); ok('clinic print text, footer image/text options, and consultation wording save in clinic settings');
     const idx = await fetch(base + '/'); assert.equal(idx.status, 200); assert.ok((await idx.text()).includes('BA Hospital Management System')); ok('frontend served');
-    assert.equal((await fetch(base + '/app.js')).status, 200); assert.equal((await fetch(base + '/styles.css')).status, 200); assert.equal((await fetch(base + '/portal.js')).status, 200); assert.equal((await fetch(base + '/portal.html')).status, 200); ok('frontend scripts, styles, and patient portal served');
+    assert.equal((await fetch(base + '/app.js')).status, 200); assert.equal((await fetch(base + '/styles.css')).status, 200); assert.equal((await fetch(base + '/portal.js')).status, 200); assert.equal((await fetch(base + '/portal.html')).status, 200); assert.equal((await fetch(base + '/approval.js')).status, 200); assert.equal((await fetch(base + '/approval.html')).status, 200); ok('frontend scripts, styles, approval page, and patient portal served');
     assert.equal((await fetch(base + '/..%2fserver.js')).status, 403); ok('path traversal blocked');
     console.log('\nAll tests passed.');
     process.exitCode = 0;

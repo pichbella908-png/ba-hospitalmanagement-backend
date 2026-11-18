@@ -5,7 +5,7 @@ const ExcelJS = require('exceljs');
 process.env.NODE_ENV = 'test';
 process.env.USE_MEM_DB = 'true';
 process.env.JWT_SECRET = 'y'.repeat(40);
-const { server } = require('./server');
+const { server, approvalEmails } = require('./server');
 const { close } = require('./db');
 
 server.listen(0, '127.0.0.1', async () => {
@@ -38,7 +38,8 @@ server.listen(0, '127.0.0.1', async () => {
   assert.match(styleSource, /\.patient-list-toolbar > \.tabs button\.on\s*\{[^}]*border:\s*1px solid #033993;[^}]*border-radius:\s*8px;[^}]*box-shadow:/, 'the selected patient tab should have a rounded blue border');
   assert.match(styleSource, /\.patient-list-actions\s*\{\s*display:\s*flex;[^}]*margin-left:\s*auto;/, 'patient list action buttons should align to the right of the toolbar');
   assert.match(styleSource, /\.patient-list-actions\s*\{[^}]*justify-content:\s*flex-end;/, 'patient list action buttons should align to the right on small screens');
-  assert.match(appSource, /if\(tok&&!needSetup\)\s*\{[\s\S]*?\$\('#lg'\)\.style\.display='none'/, 'A saved session should be restored before login can be shown');
+  assert.match(appSource, /if\(tok\)\s*\{[\s\S]*?\$\('#lg'\)\.style\.display='none'/, 'A saved session should be restored before login can be shown');
+  assert.match(indexSource, /id="signup-name"/, 'Login UI should include a clinic signup form');
   vm.runInContext(inlineScript[1], ctx);
   for (const [hostname, expectedApiBase] of [
     ['clinic-sovanvitou.synology.me', ''],
@@ -54,7 +55,13 @@ server.listen(0, '127.0.0.1', async () => {
   ctx.__nativeOpenForm = run('openForm');
   ctx.__nativePrintDoc = run('printDoc');
   try {
-    await (await fetch(base + '/api/auth/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'a@b.cc', password: 'password123' }) })).json();
+    run('setSignupMode(true)');
+    assert.equal(els['#signup-name-label'].hidden, false, 'Signup mode should show clinic administrator fields');
+    assert.equal(els['#login-submit'].dataset.a, 'signup', 'Signup mode should submit an approval request');
+    run('setSignupMode(false)');
+    await fetch(base + '/api/auth/signup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'UI Admin', clinic_name: 'UI Clinic', email: 'a@b.cc', password: 'password123' }) });
+    const approvalToken = new URL(approvalEmails[0].text.match(/https?:\/\/\S+/)[0]).searchParams.get('token');
+    await fetch(base + '/api/auth/approval', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: approvalToken, decision: 'approve' }) });
     run(`tok=null`); const lg = await (await fetch(base + '/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email: 'a@b.cc', password: 'password123' }) })).json();
     ctx.__t = lg.token; run('tok=__t; toast=function(m){__toast=m}'); await run('load()'); ok('app loads data from the API');
     const nativeQueryAll = ctx.document.querySelectorAll, nativeCreateElement = ctx.document.createElement;
