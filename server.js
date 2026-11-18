@@ -521,6 +521,21 @@ function fail(key) {
   const f = fails.get(key);
   if (!f || f.reset < Date.now()) fails.set(key, { n: 1, reset: Date.now() + 15 * 60e3 }); else f.n++;
 }
+function systemOwnerEmail() {
+  return String(process.env.SYSTEM_OWNER_EMAIL || '').trim().toLowerCase();
+}
+function sameSecret(value, expected) {
+  const actualHash = crypto.createHash('sha256').update(String(value)).digest();
+  const expectedHash = crypto.createHash('sha256').update(String(expected)).digest();
+  return crypto.timingSafeEqual(actualHash, expectedHash);
+}
+function requireSystemOwner(req) {
+  const ownerEmail = systemOwnerEmail();
+  const tok = verify((req.headers.authorization || '').replace(/^Bearer /, ''));
+  if (!ownerEmail || !tok || tok.system_owner !== true || String(tok.email || '').toLowerCase() !== ownerEmail) {
+    throw new HttpError(401, 'System owner sign-in required');
+  }
+}
 const DUMMY = '00000000000000000000000000000000:' + '00'.repeat(64);
 
 const PERMISSION_AREAS = {
@@ -577,13 +592,43 @@ function approvalMailer() {
   });
 }
 
+async function sendBrevoEmail(message, fetchImpl = fetch) {
+  const missing = ['APP_URL', 'EMAIL_FROM', 'BREVO_API_KEY'].filter((key) => !process.env[key]);
+  if (missing.length) throw new HttpError(503, 'Signup approval email is not configured on the server');
+
+  const response = await fetchImpl('https://api.brevo.com/v3/smtp/email', {
+    method: 'POST',
+    headers: {
+      accept: 'application/json',
+      'api-key': process.env.BREVO_API_KEY,
+      'content-type': 'application/json',
+    },
+    body: JSON.stringify({
+      sender: { email: process.env.EMAIL_FROM, name: 'BA Hospital Management System' },
+      to: [{ email: message.to }],
+      subject: message.subject,
+      textContent: message.text,
+      htmlContent: message.html,
+    }),
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!response.ok) throw new Error(`Brevo email request failed with HTTP ${response.status}`);
+}
+
+async function deliverApprovalEmail(message, fetchImpl = fetch) {
+  const provider = (process.env.EMAIL_PROVIDER || 'smtp').toLowerCase();
+  if (provider === 'brevo') return sendBrevoEmail(message, fetchImpl);
+  if (provider !== 'smtp') throw new HttpError(503, 'Unsupported signup email provider');
+  return approvalMailer().sendMail(message);
+}
+
 async function sendApprovalEmail(signup, token) {
   const appUrl = process.env.APP_URL || 'http://localhost:3000';
   const approvalUrl = new URL('/approval.html', appUrl);
   approvalUrl.searchParams.set('token', token);
   const approver = 'tepsochet70@gmail.com';
   const message = {
-    from: process.env.SMTP_FROM || 'BA Hospital Management System <no-reply@localhost>',
+    from: process.env.EMAIL_FROM || process.env.SMTP_FROM || 'BA Hospital Management System <no-reply@localhost>',
     to: approver,
     subject: 'Clinic signup approval request',
     text: `A clinic signup request is waiting for your approval.\n\nClinic: ${signup.clinic_name}\nAdministrator: ${signup.name}\nEmail: ${signup.email}\n\nReview and approve or reject it here:\n${approvalUrl}\n\nThis link expires in 48 hours.`,
@@ -593,7 +638,7 @@ async function sendApprovalEmail(signup, token) {
     approvalEmails.push(message);
     return;
   }
-  await approvalMailer().sendMail(message);
+  await deliverApprovalEmail(message);
 }
 
 async function signupRequest(body) {
@@ -653,6 +698,24 @@ async function signupApproval(token, decision) {
   }
   const claimed = await queryMasterOne("UPDATE signup_requests SET status='processing' WHERE id=$1 AND status='pending' RETURNING id", [signup.id]);
   if (!claimed) throw new HttpError(409, 'This signup request is already being reviewed');
+  try {
+    await provisionClinicDatabase({
+      clinicName: signup.clinic_name,
+      email: signup.email,
+      name: signup.name,
+      passwordHash: signup.pass,
+      signupRequestId: signup.id,
+    });
+    return { status: 'approved' };
+  } catch (error) {
+    await queryMaster("UPDATE signup_requests SET status='pending' WHERE id=$1 AND status='processing'", [signup.id]);
+    console.error('Clinic database provisioning failed:', error.message);
+    if (error instanceof HttpError) throw error;
+    throw new HttpError(503, 'Clinic database provisioning failed. Check PostgreSQL connectivity and database-creation privileges.');
+  }
+}
+
+async function provisionClinicDatabase({ clinicName, email, name, passwordHash, signupRequestId = null }) {
   const databaseName = `clinic_${crypto.randomBytes(16).toString('hex')}`;
   let databaseCreated = false;
   try {
@@ -660,26 +723,56 @@ async function signupApproval(token, decision) {
     databaseCreated = true;
     const user = await withTenantDatabase(databaseName, async () => {
       const owner = await queryOne('INSERT INTO users(email,name,role,permissions,pass) VALUES($1,$2,$3,$4,$5) RETURNING id',
-        [signup.email, signup.name, 'admin', '{}', signup.pass]);
-      await query('UPDATE clinic SET name=$1 WHERE id=1', [signup.clinic_name]);
+        [email, name, 'admin', '{}', passwordHash]);
+      await query('UPDATE clinic SET name=$1 WHERE id=1', [clinicName]);
       return owner;
     });
-    await txMaster(async (client) => {
-      const tenant = await client.query('INSERT INTO clinic_tenants(clinic_name,database_name) VALUES($1,$2) RETURNING id',
-        [signup.clinic_name, databaseName]);
+    const tenant = await txMaster(async (client) => {
+      const created = await client.query('INSERT INTO clinic_tenants(clinic_name,database_name) VALUES($1,$2) RETURNING id',
+        [clinicName, databaseName]);
       await client.query('INSERT INTO clinic_users(email,tenant_id,user_id) VALUES($1,$2,$3)',
-        [signup.email, tenant.rows[0].id, user.id]);
-      await client.query("UPDATE signup_requests SET status='approved',pass=NULL WHERE id=$1 AND status='processing'", [signup.id]);
+        [email, created.rows[0].id, user.id]);
+      if (signupRequestId != null) {
+        const approved = await client.query("UPDATE signup_requests SET status='approved',pass=NULL WHERE id=$1 AND status='processing' RETURNING id", [signupRequestId]);
+        if (approved.rowCount !== 1) throw new HttpError(409, 'This signup request is no longer available');
+      }
+      return created.rows[0];
     });
-    return { status: 'approved' };
+    return { id: tenant.id, clinic_name: clinicName, database_name: databaseName };
   } catch (error) {
     if (databaseCreated) {
       try { await dropTenantDatabase(databaseName); } catch (cleanupError) {
         console.error('Failed to clean up an incomplete clinic database:', cleanupError.message);
       }
     }
-    await queryMaster("UPDATE signup_requests SET status='pending' WHERE id=$1 AND status='processing'", [signup.id]);
-    console.error('Clinic database provisioning failed:', error.message);
+    throw error;
+  }
+}
+
+async function createOwnerClinic(body) {
+  const clinicName = typeof body.clinic_name === 'string' ? body.clinic_name.trim() : '';
+  const name = typeof body.name === 'string' ? body.name.trim() : '';
+  const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+  const password = typeof body.password === 'string' ? body.password : '';
+  if (!clinicName || clinicName.length > 150) throw bad('Clinic name is required and must be at most 150 characters');
+  if (!name || name.length > 100) throw bad('Administrator name is required and must be at most 100 characters');
+  if (!isEmail(email)) throw bad('Enter a valid administrator email address');
+  if (password.length < 8 || password.length > 256) throw bad('Administrator password must be 8–256 characters');
+  if (await queryMasterOne('SELECT 1 FROM users WHERE LOWER(email)=$1 LIMIT 1', [email]) ||
+      await queryMasterOne('SELECT 1 FROM clinic_users WHERE email=$1', [email])) {
+    throw new HttpError(409, 'An account already uses this email');
+  }
+  const pendingSignup = await queryMasterOne("SELECT 1 FROM signup_requests WHERE email=$1 AND status IN ('pending','processing')", [email]);
+  if (pendingSignup) throw new HttpError(409, 'A signup request for this email is already awaiting approval');
+  try {
+    return await provisionClinicDatabase({
+      clinicName,
+      email,
+      name,
+      passwordHash: await hashPw(password),
+    });
+  } catch (error) {
+    console.error('System owner clinic provisioning failed:', error.message);
     if (error instanceof HttpError) throw error;
     throw new HttpError(503, 'Clinic database provisioning failed. Check PostgreSQL connectivity and database-creation privileges.');
   }
@@ -692,6 +785,65 @@ async function api(req, res, url) {
   const ip = req.socket.remoteAddress;
 
   if (a === 'health') return send(res, 200, { ok: true });
+  if (a === 'system-owner') {
+    if (b === 'login' && m === 'POST') {
+      const ownerEmail = systemOwnerEmail();
+      const ownerPassword = process.env.SYSTEM_OWNER_PASSWORD || '';
+      if (!isEmail(ownerEmail) || ownerPassword.length < 16) {
+        throw new HttpError(503, 'System owner login is not configured. Set SYSTEM_OWNER_EMAIL and a SYSTEM_OWNER_PASSWORD of at least 16 characters.');
+      }
+      const body = await readJson(req);
+      const email = typeof body.email === 'string' ? body.email.trim().toLowerCase() : '';
+      const password = typeof body.password === 'string' ? body.password : '';
+      const key = 'system-owner|' + ip;
+      throttle(key);
+      if (email !== ownerEmail || !sameSecret(password, ownerPassword)) {
+        fail(key);
+        throw new HttpError(401, 'Wrong email or password');
+      }
+      fails.delete(key);
+      return send(res, 200, { token: sign({ system_owner: true, email: ownerEmail }) });
+    }
+    if (b === 'login') throw new HttpError(404, 'Not found');
+    requireSystemOwner(req);
+    if (b === 'clinics' && m === 'GET' && !c) {
+      const clinics = await queryMaster('SELECT id,clinic_name,database_name,created_at FROM clinic_tenants ORDER BY created_at DESC,id DESC');
+      return send(res, 200, clinics.rows);
+    }
+    if (b === 'clinics' && m === 'POST' && !c) {
+      return send(res, 201, await createOwnerClinic(await readJson(req)));
+    }
+    if (b === 'clinics' && c && /^\d+$/.test(c) && d === 'test' && m === 'POST') {
+      const clinicId = Number(c);
+      if (!Number.isSafeInteger(clinicId) || clinicId < 1) throw new HttpError(404, 'Clinic not found');
+      const clinic = await queryMasterOne('SELECT id,clinic_name,database_name FROM clinic_tenants WHERE id=$1', [clinicId]);
+      if (!clinic) throw new HttpError(404, 'Clinic not found');
+      if (!/^clinic_[a-f0-9]{32}$/.test(clinic.database_name)) throw new HttpError(409, 'Clinic database name is invalid');
+      try {
+        const result = await withTenantDatabase(clinic.database_name, () => queryOne('SELECT 1 AS ok'));
+        if (Number(result?.ok) !== 1) throw new Error('Database health query returned an unexpected result');
+      } catch (error) {
+        console.error(`System owner database connection test failed for clinic ${clinicId}:`, error.message);
+        throw new HttpError(503, 'Could not connect to this clinic database');
+      }
+      return send(res, 200, { ok: true, clinic_name: clinic.clinic_name });
+    }
+    if (b === 'clinics' && c && /^\d+$/.test(c) && !d && m === 'DELETE') {
+      const clinicId = Number(c);
+      if (!Number.isSafeInteger(clinicId) || clinicId < 1) throw new HttpError(404, 'Clinic not found');
+      const body = await readJson(req);
+      const clinic = await queryMasterOne('SELECT id,clinic_name,database_name FROM clinic_tenants WHERE id=$1', [clinicId]);
+      if (!clinic) throw new HttpError(404, 'Clinic not found');
+      if (body.confirm_name !== clinic.clinic_name || body.confirm !== true) {
+        throw bad('Type the exact clinic name and confirm deletion to permanently delete this clinic database');
+      }
+      if (!/^clinic_[a-f0-9]{32}$/.test(clinic.database_name)) throw new HttpError(409, 'Clinic database name is invalid');
+      await dropTenantDatabase(clinic.database_name);
+      await queryMaster('DELETE FROM clinic_tenants WHERE id=$1', [clinicId]);
+      return send(res, 200, { deleted: true, clinic_name: clinic.clinic_name });
+    }
+    throw new HttpError(404, 'Not found');
+  }
   if (a === 'auth' && b === 'status' && m === 'GET') {
     const tenants = await queryMasterOne('SELECT COUNT(*)::int n FROM clinic_users');
     return send(res, 200, { needsSetup: (await userCount()) === 0 && Number(tenants?.n || 0) === 0, signupEnabled: true });
@@ -1776,4 +1928,4 @@ if (require.main === module) {
     process.exit(1);
   });
 }
-module.exports = { server, approvalEmails };
+module.exports = { server, approvalEmails, deliverApprovalEmail };

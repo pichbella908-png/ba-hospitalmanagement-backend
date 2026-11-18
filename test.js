@@ -5,7 +5,7 @@ const ExcelJS = require('exceljs');
 process.env.NODE_ENV = 'test';
 process.env.USE_MEM_DB = 'true';
 process.env.JWT_SECRET = 'x'.repeat(40);
-const { server, approvalEmails } = require('./server');
+const { server, approvalEmails, deliverApprovalEmail } = require('./server');
 const { close, query } = require('./db');
 
 (async () => {
@@ -36,6 +36,43 @@ server.listen(0, '127.0.0.1', async () => {
   };
   const ok = (name) => console.log('  ✓', name);
   try {
+    const emailEnvKeys = ['EMAIL_PROVIDER', 'EMAIL_FROM', 'BREVO_API_KEY', 'APP_URL'];
+    const savedEmailEnv = Object.fromEntries(emailEnvKeys.map((key) => [key, process.env[key]]));
+    try {
+      process.env.EMAIL_PROVIDER = 'brevo';
+      process.env.EMAIL_FROM = 'verified@example.test';
+      process.env.BREVO_API_KEY = 'test-brevo-api-key';
+      process.env.APP_URL = 'https://clinic.example.test';
+      let brevoRequest;
+      const approvalMessage = {
+        to: 'tepsochet70@gmail.com',
+        subject: 'Clinic signup approval request',
+        text: 'Review the request at https://clinic.example.test/approval.html?token=test-token',
+        html: '<a href="https://clinic.example.test/approval.html?token=test-token">Review</a>',
+      };
+      await deliverApprovalEmail(approvalMessage, async (url, options) => {
+        brevoRequest = { url, options };
+        return { ok: true, status: 201 };
+      });
+      assert.equal(brevoRequest.url, 'https://api.brevo.com/v3/smtp/email');
+      assert.equal(brevoRequest.options.headers['api-key'], 'test-brevo-api-key');
+      const brevoPayload = JSON.parse(brevoRequest.options.body);
+      assert.deepEqual(brevoPayload.sender, { email: 'verified@example.test', name: 'BA Hospital Management System' });
+      assert.deepEqual(brevoPayload.to, [{ email: 'tepsochet70@gmail.com' }]);
+      assert.equal(brevoPayload.textContent, approvalMessage.text);
+      ok('Brevo approval email uses HTTPS API and configured sender');
+      await assert.rejects(
+        () => deliverApprovalEmail(approvalMessage, async () => ({ ok: false, status: 401 })),
+        /HTTP 401/,
+      );
+      ok('Brevo API rejection is reported');
+    } finally {
+      for (const key of emailEnvKeys) {
+        if (savedEmailEnv[key] === undefined) delete process.env[key];
+        else process.env[key] = savedEmailEnv[key];
+      }
+    }
+
     assert.equal((await call('GET', '/api/patients')).status, 401); ok('API rejects unauthenticated requests');
     assert.equal((await call('GET', '/api/auth/status')).body.needsSetup, true); ok('first run needs setup');
     assert.equal((await call('POST', '/api/auth/setup', { email: 'admin@clinic.test', password: 'correct-horse' })).status, 410); ok('public setup cannot bypass approval');
@@ -52,6 +89,61 @@ server.listen(0, '127.0.0.1', async () => {
     token = (await call('POST', '/api/auth/login', { email: 'admin@clinic.test', password: 'correct-horse' }, null)).body.token; assert.ok(token); ok('approved admin login returns token');
     assert.equal((await call('GET', '/api/auth/me')).body.role, 'admin'); ok('new clinic owner is an administrator');
     assert.equal((await call('GET', '/api/patients', null, token + 'x')).status, 401); ok('tampered token rejected');
+
+    const ownerEnvKeys = ['SYSTEM_OWNER_EMAIL', 'SYSTEM_OWNER_PASSWORD'];
+    const savedOwnerEnv = Object.fromEntries(ownerEnvKeys.map((key) => [key, process.env[key]]));
+    try {
+      process.env.SYSTEM_OWNER_EMAIL = 'tepsochet70@gmail.com';
+      process.env.SYSTEM_OWNER_PASSWORD = 'owner-system-password-123';
+      assert.equal((await call('GET', '/api/system-owner/clinics', null, null)).status, 401);
+      assert.equal((await call('GET', '/api/system-owner/clinics', null, token)).status, 401); ok('clinic admin tokens cannot access system-owner APIs');
+      assert.equal((await call('GET', '/api/patients', null, (await call('POST', '/api/system-owner/login', {
+        email: 'tepsochet70@gmail.com', password: 'owner-system-password-123',
+      }, null)).body.token)).status, 401); ok('system-owner tokens cannot access clinic APIs');
+      assert.equal((await call('POST', '/api/system-owner/login', {
+        email: 'someone-else@example.test', password: 'owner-system-password-123',
+      }, null)).status, 401);
+      const ownerLogin = await call('POST', '/api/system-owner/login', {
+        email: 'TEPSOCHET70@gmail.com', password: 'owner-system-password-123',
+      }, null);
+      assert.equal(ownerLogin.status, 200); assert.ok(ownerLogin.body.token);
+      const ownerToken = ownerLogin.body.token;
+      const clinics = await call('GET', '/api/system-owner/clinics', null, ownerToken);
+      assert.equal(clinics.status, 200);
+      const approvedClinic = clinics.body.find((clinic) => clinic.clinic_name === 'Test Clinic');
+      assert.ok(approvedClinic);
+      const connection = await call('POST', `/api/system-owner/clinics/${approvedClinic.id}/test`, {}, ownerToken);
+      assert.equal(connection.status, 200); assert.equal(connection.body.ok, true); ok('system owner can list clinics and test a tenant database');
+      const createdClinic = await call('POST', '/api/system-owner/clinics', {
+        clinic_name: 'Owner Test Clinic', name: 'Owner Clinic Admin', email: 'owner-clinic@clinic.test',
+        password: 'owner-created-admin-password',
+      }, ownerToken);
+      assert.equal(createdClinic.status, 201); assert.match(createdClinic.body.database_name, /^clinic_[a-f0-9]{32}$/);
+      const createdAdmin = await call('POST', '/api/auth/login', {
+        email: 'owner-clinic@clinic.test', password: 'owner-created-admin-password',
+      }, null);
+      assert.equal(createdAdmin.status, 200);
+      assert.equal((await call('GET', '/api/auth/me', null, createdAdmin.body.token)).body.role, 'admin');
+      assert.equal((await call('DELETE', `/api/system-owner/clinics/${createdClinic.body.id}`, {
+        confirm_name: 'Not the clinic name', confirm: true,
+      }, ownerToken)).status, 400);
+      assert.ok((await call('GET', '/api/system-owner/clinics', null, ownerToken)).body.some((clinic) => clinic.id === createdClinic.body.id));
+      assert.equal((await call('DELETE', `/api/system-owner/clinics/${createdClinic.body.id}`, {
+        confirm_name: 'Owner Test Clinic', confirm: false,
+      }, ownerToken)).status, 400);
+      assert.equal((await call('DELETE', `/api/system-owner/clinics/${createdClinic.body.id}`, {
+        confirm_name: 'Owner Test Clinic', confirm: true,
+      }, ownerToken)).status, 200);
+      assert.ok(!(await call('GET', '/api/system-owner/clinics', null, ownerToken)).body.some((clinic) => clinic.id === createdClinic.body.id));
+      assert.equal((await call('POST', '/api/auth/login', {
+        email: 'owner-clinic@clinic.test', password: 'owner-created-admin-password',
+      }, null)).status, 401); ok('system owner can provision and permanently delete clinics with exact-name confirmation');
+    } finally {
+      for (const key of ownerEnvKeys) {
+        if (savedOwnerEnv[key] === undefined) delete process.env[key];
+        else process.env[key] = savedOwnerEnv[key];
+      }
+    }
 
     const corsStatus = await fetch(base + '/api/health', {
       method: 'GET',
@@ -493,7 +585,7 @@ server.listen(0, '127.0.0.1', async () => {
     assert.equal(textSettings.footer_banner_mode, 'text'); assert.equal(textSettings.footer_banner_text, 'Clinic hours\nContact details');
     const ct = (await call('PUT', '/api/clinic', { cnf_text: { acc: 'Custom wording' } })).body; assert.equal(JSON.parse(ct.cnf_text).acc, 'Custom wording'); assert.equal(JSON.parse((await call('GET', '/api/clinic')).body.cnf_text).acc, 'Custom wording'); ok('clinic print text, footer image/text options, and consultation wording save in clinic settings');
     const idx = await fetch(base + '/'); assert.equal(idx.status, 200); assert.ok((await idx.text()).includes('BA Hospital Management System')); ok('frontend served');
-    assert.equal((await fetch(base + '/app.js')).status, 200); assert.equal((await fetch(base + '/styles.css')).status, 200); assert.equal((await fetch(base + '/portal.js')).status, 200); assert.equal((await fetch(base + '/portal.html')).status, 200); assert.equal((await fetch(base + '/approval.js')).status, 200); assert.equal((await fetch(base + '/approval.html')).status, 200); ok('frontend scripts, styles, approval page, and patient portal served');
+    assert.equal((await fetch(base + '/app.js')).status, 200); assert.equal((await fetch(base + '/styles.css')).status, 200); assert.equal((await fetch(base + '/portal.js')).status, 200); assert.equal((await fetch(base + '/portal.html')).status, 200); assert.equal((await fetch(base + '/approval.js')).status, 200); assert.equal((await fetch(base + '/approval.html')).status, 200); assert.equal((await fetch(base + '/owner.js')).status, 200); assert.equal((await fetch(base + '/owner.html')).status, 200); ok('frontend scripts, styles, owner console, approval page, and patient portal served');
     assert.equal((await fetch(base + '/..%2fserver.js')).status, 403); ok('path traversal blocked');
     console.log('\nAll tests passed.');
     process.exitCode = 0;

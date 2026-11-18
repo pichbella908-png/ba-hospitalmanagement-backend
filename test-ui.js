@@ -346,6 +346,7 @@ server.listen(0, '127.0.0.1', async () => {
     await new Promise((resolve) => setTimeout(resolve, 100));
     assert.ok(run(`D.users.some(item=>item.email=='permission-test@clinic.test'&&item.name=='Updated Permission Test'&&item.permissions.patients.edit)`), 'Editing an existing user should update the account and persist newly selected permissions');
     run('userFormOpen=false'); ok('Settings renders the user creation permission matrix');
+    assert.ok(run('R.set()').includes('href="owner.html"'), 'Settings should link to the restricted system-owner database console');
     run(`rt='pt';render()`);
     const patientHtml = run('R.pt()');
     assert.ok(patientHtml.includes('data-a="ptimport"') && patientHtml.includes('id="pt-import-file"') && patientHtml.includes('accept=".xlsx'), 'Patients should expose an Excel import action');

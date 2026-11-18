@@ -15,9 +15,15 @@ npm start                   # http://127.0.0.1:3000
 npm test                    # API tests + UI logic tests
 ```
 
-Open the site and choose **Create a clinic account**. The first signup creates a pending request, then sends a secure approval link to `tepsochet70@gmail.com`. Approval provisions a new PostgreSQL database for that clinic and makes the requester its administrator. The requester can sign in only after approval. Configure SMTP and `APP_URL` before offering signup.
+Open the site and choose **Create a clinic account**. The first signup creates a pending request, then sends a secure approval link to `tepsochet70@gmail.com`. Approval provisions a new PostgreSQL database for that clinic and makes the requester its administrator. The requester can sign in only after approval. Configure an email provider and `APP_URL` before offering signup.
+
+For Render Free services, use the Brevo HTTPS API: Render blocks outbound traffic on SMTP ports 25, 465, and 587. In Brevo, verify the sender email, create an API key, then set `EMAIL_PROVIDER=brevo`, `EMAIL_FROM` to the verified sender, and `BREVO_API_KEY`. Keep the key private in the Render service's Environment settings. SMTP remains available on hosts that permit outbound SMTP; set `EMAIL_PROVIDER=smtp` and configure the `SMTP_*` variables.
 
 Each clinic uses its own PostgreSQL database (`clinic_<random id>`); the configured `PGDATABASE` remains the account directory and legacy installation database. The PostgreSQL role must be allowed to create databases. Staff accounts created by a clinic administrator remain within that clinic's database.
+
+## System-owner database management
+
+Set `SYSTEM_OWNER_EMAIL` to the system owner's email (currently `tepsochet70@gmail.com`) and configure a unique `SYSTEM_OWNER_PASSWORD` with at least 16 characters in the backend environment. Keep the password private and do not reuse a clinic administrator password. Open **System owner access** from the sign-in page or **Open database management** in Settings. The owner console can list clinic databases, test a database connection, provision a clinic with its first administrator, and permanently delete a clinic database. Deletion requires typing the exact clinic name and confirming a second time; clinic-user tokens cannot use these APIs.
 
 Docker / Synology: reserve `192.168.101.12` for the NAS in your router, then use Synology Container Manager to create a Project from the repository folder containing `compose.yaml`. Copy `.env.nas.example` to `.env`, replace both placeholder values with separate strong secrets, and start the project. The app is available on the local network at `http://192.168.101.12:3000`. The app port is bound only to that NAS address; PostgreSQL and application data use persistent Docker volumes.
 
@@ -36,13 +42,18 @@ This direct HTTP address is not encrypted. Keep it on a trusted local network an
 | `PGADMIN_DATABASE`| Database used to create clinic databases           | `postgres`                                                 |
 | `PGSSL`           | Set `true` for SSL (e.g. Supabase, Neon, AWS RDS) | `false`                                                    |
 | `JWT_SECRET`      | 32+ random characters for signing tokens          | (auto-generated in DB)                                     |
+| `SYSTEM_OWNER_EMAIL` | Email allowed to sign in to database management | `tepsochet70@gmail.com`                                    |
+| `SYSTEM_OWNER_PASSWORD` | Private password for system-owner access (16+ characters) | (required for database management)                  |
 | `APP_URL`         | Public frontend URL used in approval links         | (required for signup)                                      |
-| `SMTP_HOST`       | SMTP server hostname                               | (required for signup)                                      |
+| `EMAIL_PROVIDER`  | `brevo` for HTTPS API, or `smtp`                    | `smtp`                                                     |
+| `EMAIL_FROM`      | Verified sender address for Brevo                  | (required when using Brevo)                                |
+| `BREVO_API_KEY`   | Private Brevo API key                               | (required when using Brevo)                                |
+| `SMTP_HOST`       | SMTP server hostname                               | (required when using SMTP)                                 |
 | `SMTP_PORT`       | SMTP server port                                    | `587`                                                      |
 | `SMTP_SECURE`     | Set `true` for implicit TLS (usually port 465)      | `false`                                                    |
 | `SMTP_USER`       | SMTP username, if required                          | (optional)                                                 |
 | `SMTP_PASSWORD`   | SMTP password, if required                          | (optional)                                                 |
-| `SMTP_FROM`       | Verified sender address                             | (required for signup)                                      |
+| `SMTP_FROM`       | Verified sender address                             | (required when using SMTP)                                 |
 | `PORT`            | HTTP port                                         | `3000`                                                     |
 | `TZ_OFFSET_HOURS` | UTC timezone offset (7 for Cambodia)              | `7`                                                        |
 
